@@ -1,13 +1,625 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
+// Haddad Studio Invoicing & Payment Follow-up Tool
+// Adapted to the project's existing Prisma ORM 7.10.1 setup.
+// Source: approved ERD Revision 01 DBML, plus the approved API's single-use PDF token resource.
+//
+// Important implementation notes:
+// - Keep this file at prisma/schema.prisma.
+// - DATABASE_URL is configured in the root prisma.config.ts (Prisma 7 convention).
+// - PostgreSQL CHECK constraints, PL/pgSQL functions and triggers are added to the
+//   first migration SQL using Haddad_Studio_Migration_Hardening_Prisma7.sql.
+// - PostgreSQL partial unique indexes for open pause periods are declared here using
+//   Prisma 7's partialIndexes preview feature, so do NOT create them a second time
+//   in the custom migration SQL.
+// - Both V1 (Must) and V1.1 (Should) models are included for the approved roadmap.
+// - InvoicePdfAccessToken is an additive table required by the approved API contract;
+//   it was not present in the originally uploaded ERD DBML.
 
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/prisma"
+  provider        = "prisma-client"
+  output          = "../generated/prisma"
+  previewFeatures = ["partialIndexes"]
 }
 
 datasource db {
   provider = "postgresql"
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+enum InvoiceLifecycle {
+  draft
+  sent
+  void
+
+  @@map("invoice_lifecycle")
+}
+
+enum PaymentMethod {
+  bankTransfer @map("bank_transfer")
+  cash
+  other
+
+  @@map("payment_method")
+}
+
+enum ReminderStage {
+  beforeDue3Days @map("before_due_3_days")
+  dueDate        @map("due_date")
+  afterDue7Days  @map("after_due_7_days")
+  afterDue14Days @map("after_due_14_days")
+
+  @@map("reminder_stage")
+}
+
+enum ReminderDeliveryStatus {
+  pending
+  processing
+  sent
+  skipped
+  cancelled
+  failed
+
+  @@map("reminder_delivery_status")
+}
+
+enum EmailPurpose {
+  invoiceInitial @map("invoice_initial")
+  invoiceResend  @map("invoice_resend")
+  reminder
+
+  @@map("email_purpose")
+}
+
+enum EmailAttemptStatus {
+  queued
+  accepted
+  failed
+
+  @@map("email_attempt_status")
+}
+
+enum JobRunStatus {
+  running
+  succeeded
+  partiallyFailed @map("partially_failed")
+  failed
+
+  @@map("job_run_status")
+}
+
+enum InvoiceEventType {
+  invoiceCreated     @map("invoice_created")
+  invoiceSent        @map("invoice_sent")
+  emailAttemptFailed @map("email_attempt_failed")
+  invoiceResent      @map("invoice_resent")
+  reminderSkipped    @map("reminder_skipped")
+  reminderSent       @map("reminder_sent")
+  paymentRecorded    @map("payment_recorded")
+  paymentReversed    @map("payment_reversed")
+  invoiceVoided      @map("invoice_voided")
+
+  @@map("invoice_event_type")
+}
+
+enum OperationalAlertStatus {
+  open
+  dismissed
+  resolved
+
+  @@map("operational_alert_status")
+}
+
+enum RetainerBillingStatus {
+  pending
+  invoiceCreated @map("invoice_created")
+  sent
+  skipped
+  failed
+
+  @@map("retainer_billing_status")
+}
+
+// -----------------------------------------------------------------------------
+// V1 - MUST: AUTHENTICATION AND STUDIO CONFIGURATION
+// -----------------------------------------------------------------------------
+
+model OwnerUser {
+  // Single-owner account. The database CHECK id = 1 must be added in migration SQL.
+  id           Int       @id @default(1) @db.SmallInt
+  email        String    @unique @db.VarChar(254)
+  passwordHash String    @map("password_hash") @db.VarChar(255)
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  passwordResetTokens         PasswordResetToken[]
+  authSessions                AuthSession[]
+  updatedStudioSettings       StudioSetting[]             @relation("StudioSettingsUpdatedBy")
+  createdInvoices             Invoice[]                   @relation("InvoiceCreatedBy")
+  voidedInvoices              Invoice[]                   @relation("InvoiceVoidedBy")
+  recordedPayments            Payment[]                   @relation("PaymentRecordedBy")
+  reversedPayments            PaymentReversal[]           @relation("PaymentReversedBy")
+  invoiceEvents               InvoiceEvent[]              @relation("InvoiceEventActor")
+  dismissedOperationalAlerts  OperationalAlert[]          @relation("OperationalAlertDismissedBy")
+  startedClientReminderPauses ClientReminderPausePeriod[] @relation("ClientReminderPauseStartedBy")
+  resumedClientReminderPauses ClientReminderPausePeriod[] @relation("ClientReminderPauseResumedBy")
+  updatedReminderTemplates    ReminderTemplate[]          @relation("ReminderTemplateUpdatedBy")
+  createdRetainers            Retainer[]                  @relation("RetainerCreatedBy")
+
+  @@map("owner_users")
+}
+
+model PasswordResetToken {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ownerUserId Int       @map("owner_user_id") @db.SmallInt
+  tokenHash   String    @unique @map("token_hash") @db.VarChar(255)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  usedAt      DateTime? @map("used_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  ownerUser OwnerUser @relation(fields: [ownerUserId], references: [id], onDelete: Restrict)
+
+  @@index([ownerUserId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
+model AuthSession {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ownerUserId      Int       @map("owner_user_id") @db.SmallInt
+  sessionTokenHash String    @unique @map("session_token_hash") @db.VarChar(255)
+  lastActivityAt   DateTime  @default(now()) @map("last_activity_at") @db.Timestamptz(6)
+  expiresAt        DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  ownerUser OwnerUser @relation(fields: [ownerUserId], references: [id], onDelete: Restrict)
+
+  @@index([ownerUserId])
+  @@index([expiresAt])
+  @@map("auth_sessions")
+}
+
+model StudioSetting {
+  // Singleton settings row. The database CHECK id = 1 must be added in migration SQL.
+  id                  Int      @id @default(1) @db.SmallInt
+  studioName          String   @map("studio_name") @db.VarChar(200)
+  studioAddress       String?  @map("studio_address")
+  studioPhone         String?  @map("studio_phone") @db.VarChar(50)
+  studioEmail         String?  @map("studio_email") @db.VarChar(254)
+  vatNumber           String?  @map("vat_number") @db.VarChar(100)
+  logoStorageKey      String?  @map("logo_storage_key") @db.VarChar(500)
+  logoContentType     String?  @map("logo_content_type") @db.VarChar(50)
+  logoSizeBytes       Int?     @map("logo_size_bytes")
+  paymentInstructions String?  @map("payment_instructions")
+  senderName          String?  @map("sender_name") @db.VarChar(200)
+  senderEmail         String?  @map("sender_email") @db.VarChar(254)
+  replyToEmail        String?  @map("reply_to_email") @db.VarChar(254)
+  timezone            String   @default("Asia/Beirut") @db.VarChar(64)
+  updatedByUserId     Int?     @map("updated_by_user_id") @db.SmallInt
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  updatedByUser OwnerUser? @relation("StudioSettingsUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: Restrict)
+
+  @@map("studio_settings")
+}
+
+// -----------------------------------------------------------------------------
+// V1 - MUST: CLIENTS, INVOICES, PDF SNAPSHOTS
+// -----------------------------------------------------------------------------
+
+model Client {
+  id                      String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  contactName             String    @map("contact_name") @db.VarChar(200)
+  companyName             String?   @map("company_name") @db.VarChar(200)
+  email                   String    @db.VarChar(254)
+  phone                   String?   @db.VarChar(50)
+  billingAddress          String?   @map("billing_address")
+  defaultPaymentTermsDays Int       @default(0) @map("default_payment_terms_days")
+  archivedAt              DateTime? @map("archived_at") @db.Timestamptz(6)
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  invoices             Invoice[]
+  reminderSettings     ClientReminderSetting?
+  reminderPausePeriods ClientReminderPausePeriod[]
+  retainers            Retainer[]
+
+  @@index([email])
+  @@index([archivedAt])
+  @@map("clients")
+}
+
+model InvoiceNumberCounter {
+  calendarYear Int      @id @map("calendar_year") @db.SmallInt
+  lastSequence Int      @default(0) @map("last_sequence")
+  updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("invoice_number_counters")
+}
+
+model Invoice {
+  id                 String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  clientId           String           @map("client_id") @db.Uuid
+  retainerBillingId  String?          @unique @map("retainer_billing_id") @db.Uuid
+  invoiceNumber      String?          @unique @map("invoice_number") @db.VarChar(13)
+  lifecycle          InvoiceLifecycle @default(draft)
+  issueDate          DateTime         @map("issue_date") @db.Date
+  dueDate            DateTime         @map("due_date") @db.Date
+  currencyCode       String           @default("USD") @map("currency_code") @db.Char(3)
+  vatEnabled         Boolean          @default(false) @map("vat_enabled")
+  vatRateBasisPoints Int              @default(1100) @map("vat_rate_basis_points")
+  subtotalCents      BigInt           @default(0) @map("subtotal_cents")
+  vatCents           BigInt           @default(0) @map("vat_cents")
+  totalCents         BigInt           @default(0) @map("total_cents")
+  notes              String?
+  sentAt             DateTime?        @map("sent_at") @db.Timestamptz(6)
+  sentToEmail        String?          @map("sent_to_email") @db.VarChar(254)
+  sentPdfStorageKey  String?          @map("sent_pdf_storage_key") @db.VarChar(500)
+  sentPdfSha256      String?          @map("sent_pdf_sha256") @db.Char(64)
+  sentPdfGeneratedAt DateTime?        @map("sent_pdf_generated_at") @db.Timestamptz(6)
+  voidedAt           DateTime?        @map("voided_at") @db.Timestamptz(6)
+  voidedByUserId     Int?             @map("voided_by_user_id") @db.SmallInt
+  voidReason         String?          @map("void_reason")
+  createdByUserId    Int?             @map("created_by_user_id") @db.SmallInt
+  createdAt          DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime         @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  client             Client                  @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  retainerBilling    RetainerBilling?        @relation(fields: [retainerBillingId], references: [id], onDelete: Restrict)
+  voidedByUser       OwnerUser?              @relation("InvoiceVoidedBy", fields: [voidedByUserId], references: [id], onDelete: Restrict)
+  createdByUser      OwnerUser?              @relation("InvoiceCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  lineItems          InvoiceLineItem[]
+  snapshot           InvoiceSnapshot?
+  payments           Payment[]
+  reminderDeliveries ReminderDelivery[]
+  emailAttempts      EmailAttempt[]
+  events             InvoiceEvent[]
+  pdfAccessTokens    InvoicePdfAccessToken[]
+
+  @@index([clientId])
+  @@index([lifecycle, dueDate])
+  @@index([sentAt])
+  @@index([createdAt])
+  @@map("invoices")
+}
+
+model InvoiceLineItem {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId      String   @map("invoice_id") @db.Uuid
+  lineNumber     Int      @map("line_number")
+  description    String
+  quantity       Decimal  @db.Decimal(18, 6)
+  unitPriceCents BigInt   @map("unit_price_cents")
+  lineTotalCents BigInt   @map("line_total_cents")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  @@unique([invoiceId, lineNumber])
+  @@map("invoice_line_items")
+}
+
+model InvoiceSnapshot {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId            String   @unique @map("invoice_id") @db.Uuid
+  studioName           String   @map("studio_name") @db.VarChar(200)
+  studioAddress        String?  @map("studio_address")
+  studioPhone          String?  @map("studio_phone") @db.VarChar(50)
+  studioEmail          String?  @map("studio_email") @db.VarChar(254)
+  studioVatNumber      String?  @map("studio_vat_number") @db.VarChar(100)
+  studioLogoStorageKey String?  @map("studio_logo_storage_key") @db.VarChar(500)
+  paymentInstructions  String?  @map("payment_instructions")
+  clientContactName    String   @map("client_contact_name") @db.VarChar(200)
+  clientCompanyName    String?  @map("client_company_name") @db.VarChar(200)
+  clientEmail          String   @map("client_email") @db.VarChar(254)
+  clientPhone          String?  @map("client_phone") @db.VarChar(50)
+  clientBillingAddress String?  @map("client_billing_address")
+  snapshotCreatedAt    DateTime @default(now()) @map("snapshot_created_at") @db.Timestamptz(6)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  @@map("invoice_snapshots")
+}
+
+// -----------------------------------------------------------------------------
+// API CONTRACT ADDITION: SINGLE-USE PRIVATE PDF ACCESS TOKENS
+// This table was not present in the uploaded ERD DBML. It is required by the
+// approved API contract's 10-minute, single-use PDF bearer-link design.
+// -----------------------------------------------------------------------------
+
+model InvoicePdfAccessToken {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId  String    @map("invoice_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash") @db.VarChar(255)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  redeemedAt DateTime? @map("redeemed_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  @@index([invoiceId])
+  @@index([expiresAt])
+  @@map("invoice_pdf_access_tokens")
+}
+
+// -----------------------------------------------------------------------------
+// V1 - MUST: PAYMENTS AND REVERSALS
+// -----------------------------------------------------------------------------
+
+model Payment {
+  id               String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId        String        @map("invoice_id") @db.Uuid
+  amountCents      BigInt        @map("amount_cents")
+  paymentDate      DateTime      @map("payment_date") @db.Date
+  method           PaymentMethod
+  recordedByUserId Int?          @map("recorded_by_user_id") @db.SmallInt
+  recordedAt       DateTime      @default(now()) @map("recorded_at") @db.Timestamptz(6)
+  note             String?
+
+  invoice        Invoice          @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  recordedByUser OwnerUser?       @relation("PaymentRecordedBy", fields: [recordedByUserId], references: [id], onDelete: Restrict)
+  reversal       PaymentReversal?
+  events         InvoiceEvent[]
+
+  @@index([invoiceId])
+  @@index([paymentDate])
+  @@index([recordedAt])
+  @@map("payments")
+}
+
+model PaymentReversal {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentId        String   @unique @map("payment_id") @db.Uuid
+  reversedByUserId Int?     @map("reversed_by_user_id") @db.SmallInt
+  reversedAt       DateTime @default(now()) @map("reversed_at") @db.Timestamptz(6)
+  reason           String?
+
+  payment        Payment    @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  reversedByUser OwnerUser? @relation("PaymentReversedBy", fields: [reversedByUserId], references: [id], onDelete: Restrict)
+
+  @@map("payment_reversals")
+}
+
+// -----------------------------------------------------------------------------
+// V1 - MUST: REMINDERS, EMAIL AUDIT, SCHEDULER AND FAILURE ALERTS
+// -----------------------------------------------------------------------------
+
+model ReminderDelivery {
+  id           String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId    String                 @map("invoice_id") @db.Uuid
+  stage        ReminderStage
+  scheduledFor DateTime               @map("scheduled_for") @db.Timestamptz(6)
+  status       ReminderDeliveryStatus @default(pending)
+  sentAt       DateTime?              @map("sent_at") @db.Timestamptz(6)
+  skippedAt    DateTime?              @map("skipped_at") @db.Timestamptz(6)
+  skipReason   String?                @map("skip_reason") @db.VarChar(300)
+  cancelledAt  DateTime?              @map("cancelled_at") @db.Timestamptz(6)
+  createdAt    DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime               @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  invoice       Invoice        @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  emailAttempts EmailAttempt[]
+
+  @@unique([invoiceId, stage])
+  @@index([status, scheduledFor])
+  @@map("reminder_deliveries")
+}
+
+model EmailAttempt {
+  id                   String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId            String             @map("invoice_id") @db.Uuid
+  reminderDeliveryId   String?            @map("reminder_delivery_id") @db.Uuid
+  purpose              EmailPurpose
+  recipientEmail       String             @map("recipient_email") @db.VarChar(254)
+  senderName           String?            @map("sender_name") @db.VarChar(200)
+  senderEmail          String?            @map("sender_email") @db.VarChar(254)
+  replyToEmail         String?            @map("reply_to_email") @db.VarChar(254)
+  subject              String             @db.VarChar(500)
+  body                 String?
+  attachmentStorageKey String?            @map("attachment_storage_key") @db.VarChar(500)
+  providerName         String?            @map("provider_name") @db.VarChar(100)
+  providerMessageId    String?            @map("provider_message_id") @db.VarChar(255)
+  status               EmailAttemptStatus @default(queued)
+  attemptedAt          DateTime           @default(now()) @map("attempted_at") @db.Timestamptz(6)
+  acceptedAt           DateTime?          @map("accepted_at") @db.Timestamptz(6)
+  failureCode          String?            @map("failure_code") @db.VarChar(150)
+  failureMessage       String?            @map("failure_message")
+
+  invoice          Invoice           @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  reminderDelivery ReminderDelivery? @relation(fields: [reminderDeliveryId], references: [id], onDelete: Restrict)
+  events           InvoiceEvent[]
+  operationalAlert OperationalAlert?
+
+  @@index([invoiceId])
+  @@index([reminderDeliveryId])
+  @@index([status, attemptedAt])
+  @@index([attemptedAt])
+  @@map("email_attempts")
+}
+
+model InvoiceEvent {
+  id             String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId      String           @map("invoice_id") @db.Uuid
+  actorUserId    Int?             @map("actor_user_id") @db.SmallInt
+  eventType      InvoiceEventType @map("event_type")
+  paymentId      String?          @map("payment_id") @db.Uuid
+  emailAttemptId String?          @map("email_attempt_id") @db.Uuid
+  occurredAt     DateTime         @default(now()) @map("occurred_at") @db.Timestamptz(6)
+  details        Json?            @db.JsonB
+
+  invoice      Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  actorUser    OwnerUser?    @relation("InvoiceEventActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+  payment      Payment?      @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  emailAttempt EmailAttempt? @relation(fields: [emailAttemptId], references: [id], onDelete: Restrict)
+
+  @@index([invoiceId, occurredAt])
+  @@index([eventType])
+  @@map("invoice_events")
+}
+
+model JobRun {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  jobName        String       @map("job_name") @db.VarChar(100)
+  scheduledFor   DateTime?    @map("scheduled_for") @db.Timestamptz(6)
+  startedAt      DateTime     @default(now()) @map("started_at") @db.Timestamptz(6)
+  finishedAt     DateTime?    @map("finished_at") @db.Timestamptz(6)
+  status         JobRunStatus @default(running)
+  processedCount Int          @default(0) @map("processed_count")
+  errorSummary   String?      @map("error_summary")
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  operationalAlert OperationalAlert?
+
+  @@index([jobName, startedAt])
+  @@index([status, startedAt])
+  @@map("job_runs")
+}
+
+model OperationalAlert {
+  id                String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  emailAttemptId    String?                @unique @map("email_attempt_id") @db.Uuid
+  jobRunId          String?                @unique @map("job_run_id") @db.Uuid
+  status            OperationalAlertStatus @default(open)
+  message           String
+  createdAt         DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  dismissedAt       DateTime?              @map("dismissed_at") @db.Timestamptz(6)
+  dismissedByUserId Int?                   @map("dismissed_by_user_id") @db.SmallInt
+  resolvedAt        DateTime?              @map("resolved_at") @db.Timestamptz(6)
+
+  emailAttempt    EmailAttempt? @relation(fields: [emailAttemptId], references: [id], onDelete: Restrict)
+  jobRun          JobRun?       @relation(fields: [jobRunId], references: [id], onDelete: Restrict)
+  dismissedByUser OwnerUser?    @relation("OperationalAlertDismissedBy", fields: [dismissedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([status, createdAt])
+  @@map("operational_alerts")
+}
+
+// -----------------------------------------------------------------------------
+// V1.1 - SHOULD: CLIENT REMINDER CONTROLS AND EDITABLE TEMPLATES
+// -----------------------------------------------------------------------------
+
+model ClientReminderSetting {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  clientId  String   @unique @map("client_id") @db.Uuid
+  isPaused  Boolean  @default(false) @map("is_paused")
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Restrict)
+
+  @@map("client_reminder_settings")
+}
+
+model ClientReminderPausePeriod {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  clientId        String    @map("client_id") @db.Uuid
+  pausedAt        DateTime  @map("paused_at") @db.Timestamptz(6)
+  resumedAt       DateTime? @map("resumed_at") @db.Timestamptz(6)
+  pausedByUserId  Int?      @map("paused_by_user_id") @db.SmallInt
+  resumedByUserId Int?      @map("resumed_by_user_id") @db.SmallInt
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  client        Client     @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  pausedByUser  OwnerUser? @relation("ClientReminderPauseStartedBy", fields: [pausedByUserId], references: [id], onDelete: Restrict)
+  resumedByUser OwnerUser? @relation("ClientReminderPauseResumedBy", fields: [resumedByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([clientId], where: raw("resumed_at IS NULL"), map: "uq_client_reminder_pause_one_open_per_client")
+  @@index([clientId, pausedAt])
+  @@map("client_reminder_pause_periods")
+}
+
+model ReminderTemplate {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  stage           ReminderStage @unique
+  subjectTemplate String        @map("subject_template") @db.VarChar(500)
+  bodyTemplate    String        @map("body_template")
+  updatedByUserId Int?          @map("updated_by_user_id") @db.SmallInt
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime      @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  updatedByUser OwnerUser? @relation("ReminderTemplateUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: Restrict)
+
+  @@map("reminder_templates")
+}
+
+// -----------------------------------------------------------------------------
+// V1.1 - SHOULD: MONTHLY RETAINERS AND CATCH-UP
+// -----------------------------------------------------------------------------
+
+model Retainer {
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  clientId           String    @map("client_id") @db.Uuid
+  billingDay         Int       @map("billing_day")
+  startDate          DateTime  @map("start_date") @db.Date
+  endDate            DateTime? @map("end_date") @db.Date
+  vatEnabled         Boolean   @default(false) @map("vat_enabled")
+  vatRateBasisPoints Int       @default(1100) @map("vat_rate_basis_points")
+  isActive           Boolean   @default(true) @map("is_active")
+  createdByUserId    Int?      @map("created_by_user_id") @db.SmallInt
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  client        Client             @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  createdByUser OwnerUser?         @relation("RetainerCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  lineItems     RetainerLineItem[]
+  pauses        RetainerPause[]
+  billings      RetainerBilling[]
+
+  @@index([clientId])
+  @@index([isActive, startDate, endDate])
+  @@map("retainers")
+}
+
+model RetainerLineItem {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  retainerId     String   @map("retainer_id") @db.Uuid
+  lineNumber     Int      @map("line_number")
+  description    String
+  quantity       Decimal  @db.Decimal(18, 6)
+  unitPriceCents BigInt   @map("unit_price_cents")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  retainer Retainer @relation(fields: [retainerId], references: [id], onDelete: Restrict)
+
+  @@unique([retainerId, lineNumber])
+  @@map("retainer_line_items")
+}
+
+model RetainerPause {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  retainerId String    @map("retainer_id") @db.Uuid
+  pausedFrom DateTime  @map("paused_from") @db.Date
+  resumedOn  DateTime? @map("resumed_on") @db.Date
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  retainer Retainer @relation(fields: [retainerId], references: [id], onDelete: Restrict)
+
+  @@unique([retainerId], where: raw("resumed_on IS NULL"), map: "uq_retainer_pause_one_open_per_retainer")
+  @@index([retainerId, pausedFrom])
+  @@map("retainer_pauses")
+}
+
+model RetainerBilling {
+  id           String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  retainerId   String                @map("retainer_id") @db.Uuid
+  billingMonth DateTime              @map("billing_month") @db.Date
+  scheduledFor DateTime              @map("scheduled_for") @db.Timestamptz(6)
+  status       RetainerBillingStatus @default(pending)
+  processedAt  DateTime?             @map("processed_at") @db.Timestamptz(6)
+  skipReason   String?               @map("skip_reason") @db.VarChar(300)
+  createdAt    DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime              @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  retainer Retainer @relation(fields: [retainerId], references: [id], onDelete: Restrict)
+  invoice  Invoice?
+
+  @@unique([retainerId, billingMonth])
+  @@index([status, scheduledFor])
+  @@map("retainer_billings")
 }
